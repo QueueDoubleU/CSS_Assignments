@@ -1,0 +1,961 @@
+---
+title: "QuinnWilsonProject6"
+author: "Quinn Wilson"
+date: "2024-03-31"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE}
+
+# libraries
+xfun::pkg_attach2(c("tidyverse", # load all tidyverse packages
+                    "here",      # set file path
+                    "MatchIt",   # for matching
+                    "optmatch",  # for matching
+                    "cobalt"))   # for matching assessment
+
+
+# chunk options ----------------------------------------------------------------
+knitr::opts_chunk$set(
+  warning = FALSE            # prevents warning from appearing after code chunk
+)
+
+# prevent scientific notation
+# ----------
+options(scipen = 999)
+```
+
+## 3.1 Randomization
+
+```{r}
+
+df <- read_csv("/Users/quinn/Documents/GradSchool/Spring2024/CSS/Computational-Social-Science-Training-Program/Projects/Project 6/data/ypsps.csv")
+
+```
+
+#### Generate a vector that randomly assigns each unit to either treatment or
+
+control.
+
+```{r}
+df <- df %>% 
+  mutate(RandTreatment = rbinom(n = nrow(df), size = 1, prob = 0.5),# Randomized 50% treatment effect 
+  )
+
+head(df[c("college", "RandTreatment")], 15)
+```
+
+Choose a baseline (binary) covariate for either the student or parent. Visualize the distribution of the covariate by treatment/control condition.
+
+#### student_demonstrate
+
+```{r}
+# get treatment status by whether student demonstrated 
+
+df %>%
+  
+  mutate(demonstrated = case_when(student_demonstrate == 0 ~ "No", 
+                                  student_demonstrate == 1 ~ "Yes"),
+         treatment = case_when(RandTreatment == 0 ~ "Control",
+                              RandTreatment == 1 ~ "Treatment")
+         
+  ) %>% # pipe into plot funcitons 
+  
+  ggplot(aes(x = student_demonstrate, fill = treatment)) + 
+  
+      # create a bar plot using geom_bar()
+    geom_bar() +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -1 # calculate count 
+    ) +
+    
+    # facet grid over facet_wrap
+    facet_grid(
+               cols = vars(treatment)  # facets variable in the column
+               ) + 
+   # theme 
+   theme_bw() +                        # set base black and white theme
+   theme(legend.position = "bottom") + # theme functions manipulate different elements of the plots appearance
+
+   # scales 
+   # scale_fill_manual(values=c("#800000","#027148")) +               # assign colors using hex code
+   scale_y_continuous(breaks=seq(0, 1000, 100),                    # y axis floor, ceiling, step
+                      labels = scales::label_number(scale = 1,      # scale the variable 
+                                                    accuracy = 1,   # decimal points
+                                                    big.mark = ",", # add "," or "."
+                                                    prefix = "",    # add "$" 
+                                                    suffix = ""),   # add suffix, e.g., "%" or "k"
+                      limits = c(0, 1000)) +                        # set floor and ceiling
+    # labels
+    labs(x = "Student Participation in Demonstration",  # x-axis label
+     	   y = "Count",                   # y-axis label
+     	   fill = "Treatment status",     # legend label
+         caption = "Note: ",            # add a caption
+         title = "Distribution of Demonstrative Student Treatment Status") # title 
+```
+
+***Are treatment and control balanced on this covariate?***
+
+They appear to be given the visual distribution. We can perform a X\^2 test to confirm
+
+```{r}
+
+# Run chai squared test 
+chisq.test(table(df$RandTreatment, df$student_demonstrate))
+```
+
+Given the large p-value, we do not see evidence that the treatment and control groups are unbalanced
+
+#### Simulate the first 3 steps 10,000 times and visualize the distribution of
+
+treatment/control balance across the simulations.
+
+```{r}
+##install.packages("reshape2")
+```
+
+```{r}
+set.seed(123) # reproducibility 
+
+differences <- replicate(10000, {
+  # Randomly assign treatment
+  df$RandTreatment <- rbinom(n = nrow(df), size = 1, prob = 0.5)
+  
+  # create table to easily calculate differences with 
+  diff_table <- table(df$RandTreatment, df$student_demonstrate)
+  
+  # find difference in treatment vs control of demonstration
+  dnd_diff <- diff_table["1", "0"] - diff_table["0", "0"]
+  d_diff <- diff_table["1", "1"] - diff_table["0", "1"]
+  
+  # return vector of two differences
+  c(dnd_diff, d_diff)
+}, simplify = "array")
+
+differences_T = t(differences)
+
+
+# Convert to data frame for plotting
+diff_df <- data.frame("DND" = differences_T[,1], "Demonstrated" = differences_T[,2])
+
+# Melt the data frame for easier plotting 
+library(reshape2)
+diff_df_melted <- melt(diff_df)
+
+# Plot 
+ggplot(diff_df_melted, aes(x = value)) +
+  geom_histogram(binwidth = 1, fill = "blue", color = "grey", alpha = 0.8) +
+  facet_wrap(~ variable, ncol = 1, scales = "free_y", labeller = labeller(variable = c(`DND` = "Did Not Demonstrate", `Demonstrated` = "Demonstrated"))) +
+  theme_minimal() +
+  labs(title = "Distribution of Differences in Counts",
+       x = "Difference in Counts",
+       y = "Frequency")
+
+```
+
+#### What do you see across your simulations? Why does independence of treatment assignment and baseline covariates not guarantee balance of treatment assignment and baseline covariates?
+
+The simulations produced expected distributions – the difference in treatment assignment and covariates centers on 0 and follows a binomial distribution. While this may give us confidence that randomization is likely to produce evenly balanced treatment and control on our covariate, it does not guarantee it. Despite independence of treatment assignment and covariate, there is still a possibility we will not have matched or balanced data.
+
+## 4 Propensity Score Matching
+
+### 4.1 One Model
+
+Select covariates that you think best represent the “true” model predicting whether a student chooses to attend college, and estimate a propensity score model to calculate the Average Treatment Effect on the Treated (ATT). Plot the balance of the covariates. Report the balance of the p-scores across both the treatment and control groups, and using a threshold of standardized mean difference of p-score ≤ .1, report the number of covariates that meet that balance threshold.
+
+```{r}
+
+colnames(df)
+```
+
+```{r}
+
+# We can simplify the logistic regression and matching process using matchit
+# Our formula will regress "college" (treatment) on our covariates 
+# --------------------------------------------------
+match_exact_att <- matchit(formula = college ~ student_GPA + parent_Employ, # formula
+                           data = df, # specify dataset 
+                           method = "exact", # matching method
+                           estimand = "ATT") # estimand
+
+# summary 
+summary(match_exact_att, un = FALSE) # 
+```
+
+```{r}
+# We can estimate ATT using linear regression from our exact match ATT
+
+# construct a matched dataset with matchit
+match_exact_att_data <- match.data(match_exact_att)
+
+# specify a linear model 
+lm_exact_att <- lm(student_ppnscal ~ college + student_GPA + parent_Employ,    # specify linear regression 
+                   data = match_exact_att_data, # data
+                   weights = weights)           # weights 
+
+# view summary of results 
+lm_exact_att_summ <- summary(lm_exact_att)
+lm_exact_att_summ
+
+#
+# grab ATT
+# ---------
+ATT_exact <- lm_exact_att_summ$coefficients["college", "Estimate"]
+ATT_exact
+```
+
+------------------------------------------------------------------------
+
+Plot the balance of the covariates. Report the balance of the p-scores across both the treatment and control groups, and using a threshold of standardized mean difference of p-score ≤ .1, report the number of covariates that meet that balance threshold.
+
+I use the cobalt package per suggestion given its design for this purpose
+
+```{r}
+
+library("cobalt")
+match_exact_att
+```
+
+```{r}
+
+# love plot to show standardized mean differences
+love.plot(match_exact_att, # dataset 
+         abs = TRUE, # absolute standardized mean differences 
+         thresholds = 0.1) # define threshold parameter per prompt 
+```
+
+Sum the number of covariates
+
+```{r}
+
+# Generate a balance table to see SMD scores 
+balance_table <- bal.tab(match_exact_att, abs = TRUE)
+
+balance_table$Balance
+```
+
+\*\*Here we can see that both covariates selected fall well below the SMD threshold of 0.1
+
+------------------------------------------------------------------------
+
+*I inadvertently read the prompt as "Select **two** covariates that you think best represent the true model." Below, I rerun the above process but for all pre-treatment covariates.*
+
+```{r}
+
+df_pretreat <- df %>%
+  select(-((ncol(df)-2):ncol(df))) %>% # drop rand treat variables made earlier
+  select(-matches("1973|1982")) %>% # drop post-treatment vars
+  select_if(~ !any(is.na(.))) # drop columns with NA values for matchit below
+
+
+
+head(df_pretreat)
+# grep(df_pretreat[c("student_1973Married", "student_1982money")]) # select two post treatment vars as a test
+
+
+```
+
+The commented line produces an error as expected. Continuing on to reproduce earlier steps with pre-treatment covariates.
+
+```{r}
+
+match_ps_att_all <- matchit(formula = college ~ ., # all covariates
+                        data = df_pretreat, # pretreatment df
+                        method = "nearest",
+                        estimand = "ATT",
+                        distance = "glm",
+                        link = "logit",
+                        discard = "control",
+                        replace = FALSE,
+                        ratio = 2)
+
+# summary
+summary(match_ps_att_all, un = FALSE)
+# --------------------------------------------------
+
+```
+
+```{r}
+
+# construct a matched dataset from the matchit object
+match_ps_att_all_data <- match.data(match_ps_att_all)
+
+# specify linear model 
+lm_ps_att_all <- glm(student_ppnscal ~ .,  # formula
+                data = match_ps_att_all_data,  # data
+                weights = weights)         # weights 
+
+# view summary results 
+lm_ps_att_all_summ <- summary(lm_ps_att_all)
+print(lm_ps_att_all_summ)
+
+#
+# pull out ATT
+# ---------
+ATT_ps_all <- lm_ps_att_all_summ$coefficients["college", "Estimate"]
+ATT_ps_all
+
+
+```
+
+```{r}
+# love plot to show standardized mean differences
+love.plot(match_ps_att_all, # dataset 
+         abs = TRUE, # absolute standardized mean differences 
+         thresholds = 0.1,# define threshold parameter per prompt 
+         # stats,
+         stars = "raw") 
+```
+
+```{r}
+# balance stats
+balance_stats <- bal.tab(match_ps_att_all, abs = TRUE, un = TRUE)
+
+# Count from Balance Table, Diff.Adj column
+num_cov_meeting_threshold <- sum(balance_stats$Balance$Diff.Adj <= 0.1, na.rm = TRUE)
+
+print(balance_stats)
+```
+
+```{r}
+
+length(balance_stats$Balance$Diff.Adj)
+```
+
+### 4.2 Simulations
+
+Henderson/Chatfield argue that an improperly specified propensity score model can actually increase the bias of the estimate. To demonstrate this, they simulate 800,000 different propensity score models by choosing different permutations of covariates.
+
+To investigate their claim, do the following: • Using as many simulations as is feasible (at least 10,000 should be ok, but more is better!), randomly select the number of and the choice of covariates for the propensity score model.
+
+```{r}
+set.seed(123) 
+
+### Select Covariates Function 
+
+# Function to randomly select covariates and return a subset dataframe
+select_cov_ps <- function(data, treatment_var, outcome_var) {
+  # Get all column names excluding the treatment and outcome variable
+  covariate_names <- setdiff(names(data), c(treatment_var, outcome_var))
+  
+  # Randomly decide how many covariates to include (at least 1)
+  num_covs <- sample(1:length(covariate_names), 1)
+  
+  # Randomly select 'num_covs' covariates
+  selected_covs <- sample(covariate_names, num_covs)
+  
+  # Add back in the treatment and control variables
+  selected_covs <- c(treatment_var, outcome_var, selected_covs)
+  
+  # Return dataframe with the selected covariates including the treatment and control variable
+  return(data[, selected_covs])
+}
+
+```
+
+```{r}
+###### TEST 
+
+# test 
+test_df <- select_cov_ps(df_pretreat, "college", "student_ppnscal")
+test_df
+```
+
+```{r}
+
+### Run MatchIt Function I
+
+ps_model <- function(rand_cov_df, treatment_var, outcome_var) {
+    # List all covariates except 'college' and the outcome variable 'student_ppnscal'
+    covariate_names <- setdiff(names(rand_cov_df), c("college", "student_ppnscal"))
+    
+    # Construct the formula manually
+    formula_str <- paste("college ~", paste(covariate_names, collapse = " + "))
+    match_formula <- as.formula(formula_str)
+    
+    # Run MatchIt with the constructed formula
+    match_ps_att_samp <- matchit(formula = match_formula,
+                                  data = rand_cov_df,
+                                  method = "nearest",
+                                  estimand = "ATT",
+                                  distance = "glm",
+                                  link = "logit",
+                                  discard = "control",
+                                  replace = FALSE,
+                                  ratio = 2)
+    
+    # return
+    return(match_ps_att_samp)
+    
+}
+
+```
+
+```{r}
+##### Construct MatchIt dataset and grab ATT 
+
+
+create_matchit_ds <- function(matchit_obj) {
+    # construct a matched dataset from the matchit object
+    match_ps_att_samp_data <- match.data(matchit_obj)
+    
+    # specify linear model 
+    lm_ps_att_all <- glm(student_ppnscal ~ .,  # formula
+                    data = match_ps_att_samp_data,  # data
+                    weights = weights)         # weights 
+    
+    # view summary results 
+    lm_ps_att_all_summ <- summary(lm_ps_att_all)
+    print(lm_ps_att_all_summ)
+    
+    # pull out ATT
+    ATT_ps_all <- lm_ps_att_all_summ$coefficients["college", "Estimate"]
+    
+    return(list(ATT_ps_all = ATT_ps_all, 
+                match_ps_att_samp_data = match_ps_att_samp_data))
+}
+
+```
+
+```{r}
+# TEST 
+test_match_ps_att_samp <- ps_model(test_df, treatment_var, outcome_var)
+
+test_match_results <- create_matchit_ds(test_match_ps_att_samp)
+
+test_match_ds <- test_match_results$match_ps_att_samp_data
+
+test_match_ds
+```
+
+```{r}
+###### Threshold and Results Function 
+
+
+# Get number of threshold ps and the mean percent improvement in SMD
+num_threshold_covs <- function(match_obj) {
+  
+  # Generate balance stats for both pre and post-matching
+  balance_stats <- bal.tab(match_obj, abs = TRUE, un = TRUE)
+  # print(balance_stats)
+  
+  # Extracting pre and post-matching SMDs
+  smd_pre <- balance_stats$Balance$Diff.Un
+  smd_post <- balance_stats$Balance$Diff.Adj
+
+  # Count from Balance Table Diff.Adj column for post-matching
+  num_cov_meeting_threshold <- sum(smd_post <= 0.1, na.rm = TRUE)
+
+  # Proportion of covariates meeting the threshold
+  cov_size <- length(smd_post)
+  prop <- num_cov_meeting_threshold / cov_size
+  
+  # Calculate percent improvement per covariate
+  improvements <- (smd_pre - smd_post) / abs(smd_pre) * 100
+
+  # Mean percent improvement across all covariates
+  mean_improvement <- mean(improvements, na.rm = TRUE)
+
+  # Return a list of both metrics
+  return(list(
+    num_threshold_covariates = num_cov_meeting_threshold,
+    proportion_threshold = prop,
+    mean_percent_improvement = mean_improvement
+  ))
+}
+
+```
+
+```{r}
+# TEST 
+
+test_threshold_results <- num_threshold_covs(test_match_ps_att_samp)
+```
+
+```{r}
+library(parallel)
+```
+
+```{r}
+
+# Set up and run the simulation
+set.seed(123)
+
+# Define number of runs
+runs <- 10
+
+# Pre-allocate results dataframe
+results <- data.frame(
+  Simulation = integer(runs),
+  ATT = numeric(runs),
+  Proportion_Threshold = numeric(runs),
+  Mean_Percent_Improvement = numeric(runs),
+  Threshold_Covs = integer(runs),
+  Balance_Stats = list(runs)
+)
+
+# Define vars
+treatment_var <- "college"
+outcome_var <- "student_ppnscal"
+
+# Define a single iteration function
+iteration_function <- function(i) {
+  rand_cov_df <- select_cov_ps(df_pretreat, treatment_var, outcome_var)
+  match_obj <- ps_model(rand_cov_df, treatment_var, outcome_var)
+  matched_results <- create_matchit_ds(match_obj)
+  ATT <- matched_results$ATT_ps_all
+  matched_ds <- matched_results$match_ps_att_samp_data
+  balance_metrics <- num_threshold_covs(match_obj)
+  
+  c(
+    Simulation = i,
+    ATT = ATT,
+    Proportion_Threshold = balance_metrics$proportion_threshold,
+    Mean_Percent_Improvement = balance_metrics$mean_percent_improvement,
+    Threshold_Covs = balance_metrics$num_threshold_covariates
+  )
+}
+
+
+
+```
+
+```{r}
+
+# Set up a cluster
+cl <- makeCluster(detectCores() - 1)  # Leave one core free
+
+# Load required packages on all nodes
+clusterEvalQ(cl, {
+  library(MatchIt)
+  library(cobalt)
+})
+
+# Export necessary objects and functions to the worker nodes
+clusterExport(cl, list("select_cov_ps", "ps_model", "create_matchit_ds", "num_threshold_covs", "df_pretreat", "treatment_var", "outcome_var"))
+
+# Execute parallel processing
+results <- parSapply(cl, 1:runs, iteration_function)
+stopCluster(cl)
+
+# Process results as needed
+
+```
+
+```{r}
+head(t(results))
+results <- t(results)
+```
+
+Plot all of the ATTs against all of the balanced covariate proportions. You
+may randomly sample or use other techniques like transparency if you run
+into overplotting problems. Alternatively, you may use plots other than
+scatterplots, so long as you explore the relationship between ATT and the
+proportion of covariates that meet the balance threshold.
+
+```{r}
+
+# plotting as scatterplot relationship 
+ggplot(as.data.frame(results), aes(x = Proportion_Threshold, y = ATT)) +
+  geom_point(alpha = 0.1) # very low transparency 
+  labs(x = "Proportion of Covariates Meeting Balance Threshold",
+       y = "Average Treatment Effect on Treated (ATT)",
+       title = "Relationship between ATT and Balance Threshold Proportion") +
+  theme_minimal()
+```
+
+```{r}
+
+# Try hex plots given very dense data
+
+##install.packages("hexbin")
+
+ggplot(as.data.frame(results), aes(x = Proportion_Threshold, y = ATT)) +
+  geom_hex() +
+  labs(x = "Proportion of Covariates Meeting Balance Threshold",
+       y = "Average Treatment Effect on Treated (ATT)",
+       title = "Hexbin Plot of ATT and Balance Threshold Proportion") +
+  theme_minimal()
+```
+
+Finally choose 10 random models and plot their covariate balance plots
+
+```{r}
+
+head(results)
+```
+
+```{r}
+
+# Running a differnet version to grab data for later plotting covariant balance
+
+
+# runs <- 10000 ### UNCOMMENT OUT 
+
+iteration_function <- function(i) {
+  rand_cov_df <- select_cov_ps(df_pretreat, treatment_var, outcome_var)
+  match_obj <- ps_model(rand_cov_df, treatment_var, outcome_var)
+  matched_results <- create_matchit_ds(match_obj)
+  
+  # Get balance metrics and compute balance tables directly for storage
+  balance_metrics <- num_threshold_covs(match_obj)
+  balance_stats <- bal.tab(match_obj, abs = TRUE, un = TRUE)  # Compute balance stats for potential plotting
+
+  # Only return necessary summary data, not full matchit objects
+  list(
+    Simulation = i,
+    ATT = matched_results$ATT_ps_all,
+    Proportion_Threshold = balance_metrics$proportion_threshold,
+    Mean_Percent_Improvement = balance_metrics$mean_percent_improvement,
+    Threshold_Covs = balance_metrics$num_threshold_covariates,
+    Balance_Stats = list(Diff.Un = balance_stats$Balance$Diff.Un, 
+                         Diff.Adj = balance_stats$Balance$Diff.Adj)  # Store only Diff stats
+  )
+}
+
+```
+
+```{r}
+
+# Set up the cluster
+cl <- makeCluster(detectCores() - 1)
+clusterEvalQ(cl, {
+  library(MatchIt)
+  library(cobalt)
+})
+clusterExport(cl, list("select_cov_ps", "ps_model", "create_matchit_ds", "num_threshold_covs", "df_pretreat", "treatment_var", "outcome_var"))
+
+# Execute parallel processing
+results_final <- parLapply(cl, 1:runs, iteration_function)
+stopCluster(cl)
+
+```
+
+```{r}
+
+#### Pevously used block 
+selected_indices <- sample(1:length(results_final), 10)  # Select 10 random simulations
+
+# Plot balance statistics for selected simulations
+for (idx in selected_indices) {
+  balance_stats <- results_final[[idx]]$Balance_Stats
+  plot_data <- data.frame(Diff.Un = balance_stats$Diff.Un, Diff.Adj = balance_stats$Diff.Adj)
+  p <- ggplot(plot_data, aes(x = Diff.Un, y = Diff.Adj)) +
+    geom_point() +
+    labs(title = paste("Balance Plot for Simulation", results_final[[idx]]$Simulation),
+         x = "Unadjusted Differences", y = "Adjusted Differences") +
+    theme_minimal()
+  
+  print(p)
+}
+
+```
+
+```{r}
+# Was having issues with GridExtra, so I've just plotted 10 different make-shift balance plots 
+
+# Loop through the first 10 simulations and generate a point plot for each
+for (i in 1:10) {
+    # Extract balance data for this iteration
+    balance_data <- results_final[[i]]$Balance_Stats
+
+    # Compute means
+    mean_diff_un <- mean(balance_data$Diff.Un)
+    mean_diff_adj <- mean(balance_data$Diff.Adj)
+
+    # Create a dataframe for plotting
+    balance_summary_df <- data.frame(
+        Type = c("Unadjusted", "Adjusted"),
+        Mean_SMD = c(mean_diff_un, mean_diff_adj)
+    )
+
+    # Create the point plot
+    p <- ggplot(balance_summary_df, aes(x = Type, y = Mean_SMD, color = Type)) +
+        geom_point(size = 5) +
+        scale_color_manual(values = c("Unadjusted" = "indianred1", "Adjusted" = "cyan3")) +
+        theme_minimal() +
+        theme(legend.position = "none",
+              plot.title = element_text(hjust = 0.5)) +
+        labs(title = paste("Simulation", i),
+             x = "",
+             y = "Mean Standardized Mean Differences (SMD)")
+
+    # Print the plot
+    print(p)
+}
+
+```
+
+```{r}
+balance_data
+```
+
+### 4.3 Questions 
+
+1. How many simulations resulted in models with a higher proportion of balanced covariates? Do you have any concerns about
+this?
+
+```{r}
+
+count_more_balanced_cov <- sum(sapply(results_final, function(x) x$Mean_Percent_Improvement < 0))
+count_more_balanced_cov
+```
+
+Concerningly, there appear to be no instances where the Adjusted SMD improves... there must be an error in the code but I do not see what it is. That being said, we would hope to see a high degree of improvement after matching. If more than maybe half of the simulations saw a decrease in the proportion of balanced covariates I would be concerned. That indicates that matching on a linear regression was not an effective means of aligning data or that many samples were dropped and thus not matched.
+
+2\. Analyze the distribution of the ATTs. Do you have any concerns
+about this distribution?
+
+```{r}
+
+# Plot a histogram of ATTs 
+
+att_values <- sapply(results_final, function(x) x$ATT)
+
+# Create a histogram of the ATT values
+ggplot(data.frame(ATT = att_values), aes(x = ATT)) +
+  geom_histogram(binwidth = 0.1, fill = "cyan3", color = "black") +
+  theme_minimal() +
+  labs(title = "Histogram of Average Treatment Effects (ATT)",
+       x = "ATT",
+       y = "Frequency")
+```
+
+The obvious concern here is the spike at 0 of the ATT. We could see glimpses of this in the hex diagram above but it is now clear that the most likely outcome is zero.
+
+3\. Do your 10 randomly chosen covariate balance plots produce similar numbers on the same covariates? Is it a concern if they
+do not?
+
+The 10 randomly selected plots do not have very similar SMDs. Typically, if there is a large difference in pre and post-adjustment scores we would expect it to indicate there were confounding variables pre-adjustment and that we have successfully accounted for them. Here, though, the scores increase, which I again am interpreting as an error in my code rather than a truth given it occurs for all simulations.
+
+### 5.1 Simulate Alternative Model
+
+Henderson/Chatfield propose using genetic matching to learn the best weights
+for Mahalanobis distance matching. Choose a matching algorithm other than
+the propensity score (you may use genetic matching if you wish, but it is also
+fine to use the greedy or optimal algorithms we covered in lab instead). Repeat
+the same steps as specified in Section 4.2
+
+```{r}
+
+### Run MatchIt Function -- updated function for genetic 
+
+genetic_ps_model <- function(rand_cov_df, treatment_var, outcome_var) {
+    # List all covariates except 'college' and the outcome variable 'student_ppnscal'
+    covariate_names <- setdiff(names(rand_cov_df), c("college", "student_ppnscal"))
+    
+    # Construct the formula manually
+    formula_str <- paste("college ~", paste(covariate_names, collapse = " + "))
+    match_formula <- as.formula(formula_str)
+    
+    # Run MatchIt with the constructed formula
+    genetic_ps_att <- matchit(formula = match_formula,
+                                  data = rand_cov_df,
+                                  method = "genetic",
+                                  estimand = "ATT"
+                                 )
+    
+    # return
+    return(genetic_ps_att)
+    
+}
+```
+
+```{r}
+
+# Running a differnet version to grab data for later plotting covariant balance
+treatment_var = "college"
+outcome_var = "student_ppnscal"
+
+runs <- 10 ### UNCOMMENT OUT
+
+iteration_function <- function(i) {
+  rand_cov_df <- select_cov_ps(df_pretreat, treatment_var, outcome_var)
+  match_obj <- genetic_ps_model(rand_cov_df, treatment_var, outcome_var)
+  matched_results <- create_matchit_ds(match_obj)
+  
+  # Get balance metrics and compute balance tables directly for storage
+  balance_metrics <- num_threshold_covs(match_obj)
+  balance_stats <- bal.tab(match_obj, abs = TRUE, un = TRUE)  # Compute balance stats for potential plotting
+
+  # Only return necessary summary data, not full matchit objects
+  list(
+    Simulation = i,
+    ATT = matched_results$ATT_ps_all,
+    Proportion_Threshold = balance_metrics$proportion_threshold,
+    Mean_Percent_Improvement = balance_metrics$mean_percent_improvement,
+    Threshold_Covs = balance_metrics$num_threshold_covariates,
+    Balance_Stats = list(Diff.Un = balance_stats$Balance$Diff.Un, 
+                         Diff.Adj = balance_stats$Balance$Diff.Adj)  # Store only Diff stats
+  )
+}
+```
+
+```{r}
+# I think these are for genetic matching 
+#install.packages("Matching")
+#install.packages("rgenoud")
+
+```
+
+## One week later and three attempts later, I never managed to complete a full run of 10,000 iterations with the genetic algorithm. For the sake of submission I have limited the analysis below to 10 runs and explain my analysis with the caveat of a small sample size. 
+
+```{r}
+
+### Run clusters 
+
+# Set up the cluster
+cl <- makeCluster(detectCores() - 1)
+clusterEvalQ(cl, {
+  library(MatchIt)
+  library(cobalt)
+  library(Matching)
+  library(rgenoud)
+})
+clusterExport(cl, list("select_cov_ps", "genetic_ps_model", "create_matchit_ds", "num_threshold_covs", "df_pretreat", "treatment_var", "outcome_var"))
+
+# Execute parallel processing
+genetic_results <- parLapply(cl, 1:runs, iteration_function)
+stopCluster(cl)
+```
+
+```{r}
+genetic_df <- do.call(rbind, lapply(genetic_results, function(x) {
+  data.frame(Simulation = x$Simulation,
+             ATT = x$ATT,
+             Proportion_Threshold = x$Proportion_Threshold,
+             Mean_Percent_Improvement = x$Mean_Percent_Improvement,
+             Threshold_Covs = x$Threshold_Covs,
+             Mean_Diff_Un = mean(x$Balance_Stats$Diff.Un),
+             Mean_Diff_Adj = mean(x$Balance_Stats$Diff.Adj))
+}))
+
+print(genetic_df)
+```
+
+```{r}
+
+# Plot ATT vs proportion 
+ggplot(as.data.frame(genetic_df), aes(x = Proportion_Threshold, y = ATT)) +
+  geom_point(alpha = 0.9)
+  labs(x = "Proportion of Covariates Meeting Balance Threshold",
+       y = "Average Treatment Effect on Treated (ATT)",
+       title = "Relationship between ATT and Balance Threshold Proportion") +
+  theme_minimal()
+```
+
+```{r}
+
+### Plotting covariate balances again 
+for (i in 1:10) {
+    # Extract balance data for this iteration
+    balance_data <- genetic_results[[i]]$Balance_Stats
+
+    # Compute means
+    mean_diff_un <- mean(balance_data$Diff.Un)
+    mean_diff_adj <- mean(balance_data$Diff.Adj)
+
+    # Create a dataframe for plotting
+    balance_summary_df <- data.frame(
+        Type = c("Unadjusted", "Adjusted"),
+        Mean_SMD = c(mean_diff_un, mean_diff_adj)
+    )
+
+    # Create the point plot
+    p <- ggplot(balance_summary_df, aes(x = Type, y = Mean_SMD, color = Type)) +
+        geom_point(size = 5) +
+        scale_color_manual(values = c("Unadjusted" = "indianred1", "Adjusted" = "cyan3")) +
+        theme_minimal() +
+        theme(legend.position = "none",
+              plot.title = element_text(hjust = 0.5)) +
+        labs(title = paste("Simulation", i),
+             x = "",
+             y = "Mean Standardized Mean Differences (SMD)")
+
+    # Print the plot
+    print(p)
+}
+
+```
+
+#### Does your alternative matching method have more runs with
+higher proportions of balanced covariates?
+
+```{r}
+
+final_results_df <- do.call(rbind, lapply(results_final, function(x) {
+  data.frame(Simulation = x$Simulation,
+             ATT = x$ATT,
+             Proportion_Threshold = x$Proportion_Threshold,
+             Mean_Percent_Improvement = x$Mean_Percent_Improvement,
+             Threshold_Covs = x$Threshold_Covs,
+             Mean_Diff_Un = mean(x$Balance_Stats$Diff.Un),
+             Mean_Diff_Adj = mean(x$Balance_Stats$Diff.Adj))
+}))
+
+print(head(final_results_df))
+```
+
+```{r}
+
+final_prop <- mean(final_results_df$Proportion_Threshold)
+genetic_prop <- mean(genetic_df$Proportion_Threshold)
+
+final_prop
+genetic_prop
+```
+
+Based on the small sample, the exact matching method – not the genetic matching – yielded an overall higher proportion of balanced covariates. Had I actually been able to run a full 10,000 simulations the values may have been similar or even flipped but I can only speak to the data I was able to generate.
+
+```{r}
+##install.packages("patchwork")
+library("patchwork")
+```
+
+```{r}
+# Facet plot requires a single df which is difficult here given the mismatched data sizes
+# Instead I use patchwork to plot two different graphs 
+p1 <- ggplot(final_results_df, aes(x = Mean_Percent_Improvement)) +
+  geom_histogram(binwidth = 1, fill = "cyan3", color = "black") +
+  scale_x_continuous(limits = c(-100, 50))
+  theme_minimal() +
+  labs(title = "Histogram of Exact Match Percent Improvement",
+       x = "Mean Percent Improvement",
+       y = "Frequency")
+
+  p2 <- ggplot(genetic_df, aes(x = Mean_Percent_Improvement)) +
+  geom_histogram(binwidth = 1, fill = "cyan3", color = "black") +
+  scale_x_continuous(limits = c(-100, 50))
+  theme_minimal() +
+  labs(title = "Histogram of Genetic Match Percent Improvement",
+       x = "Mean Percent Improvement",
+       y = "Frequency")
+  
+  combined_plot <- p1 / p2
+  
+  # Customize layout and add a plot title
+final_plot <- combined_plot + 
+  plot_layout(guides = 'collect') +  # Collect legends if necessary
+  plot_annotation(title = "Comparison of Mean Percent Improvements")
+
+# Print the final combined plot
+print(final_plot)
+```
+
+Despite the small sample size it is already evident that the genetic matching algorithm is performing similarly. The improvement is again negative which I believe to be attributable to how I manually calculated the SMDs, though I don't understand why. It is interesting that both seem to center on 50% "improvement" – I am not sure whether this is an expected outcome for any data or if it is particular to our sample.
+
+### Discussion Questions 
+
+1\. Why might it be a good idea to do matching even if we have a randomized
+or as-if-random design?
+
+Even in a randomized design setup, conducting matching can help enhance the robustness of the results as we saw in the first part of this project with improving covariate balance. We might expect randomization to balance covariates across treatment and control groups, but in practice, especially with small sample sizes, random allocation might not achieve adequate balance. Matching post-randomization can further balance covariates, reducing variance and improving the precision of the estimated treatment effects. If randomization inadvertently results in imbalances in key covariates, matching can correct these ensuring that the comparison between treatment and control groups is as fair as possible.
+
+2\. The standard way of estimating the propensity score is using a logistic regression to estimate probability of treatment. Given what we know about the curse of dimensionality, do you think there might be advantages to using other machine learning algorithms (decision trees, bagging/boosting forests, ensembles, etc.) to estimate propensity scores instead?
+
+Decision Tree and Random Forest models may be well-suited for capturing interactions between variables that a logistic regression might miss and are capable of modeling non-linear relationships that could become misrepresented in logistic regressions. They also don't need the researcher to explicitly specify interaction terms as we did here. Boosting then would also be valuable given its expansion on decision trees and error correcting process. I believe it would also offer a strong predictor given it combines multiple weak predictors.
