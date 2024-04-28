@@ -1,6 +1,8 @@
 ---
 title: "Project 7: Difference-in-Differences and Synthetic Control"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r}
@@ -290,7 +292,7 @@ plot(syn)
 ```
 
 ```{r}
-virginia_synvirginia %>% filter((State == 'Virginia' ) & (year >= 2019))
+# virginia_synvirginia %>% filter((State == 'Virginia' ) & (year >= 2019))
 ```
 
 ```{r}
