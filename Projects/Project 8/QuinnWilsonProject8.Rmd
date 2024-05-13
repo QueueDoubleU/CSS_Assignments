@@ -189,10 +189,10 @@ Using ggdag and daggity, draw a directed acylcic graph (DAG) that describes the 
 # DAG for TMLE
 # install packages
 
-install.packages("ggdag")
-install.packages("dagitty")
-library(ggdag)
-library(dagitty)
+# install.packages("ggdag")
+# install.packages("dagitty")
+# library(ggdag)
+# library(dagitty)
 
 
 ```
@@ -241,7 +241,7 @@ W <- heart_disease_t1 %>%
 ```
 
 ```{r}
-sl_lib <- c('SL.mean', 'SL.ranger', 'SL.glm')
+sl_libs <- c('SL.mean', 'SL.ranger', 'SL.glm')
 ```
 
 ```{r}
@@ -253,8 +253,8 @@ tmle_fit <-
   tmle::tmle(Y = Y,                  # outcome
              A = A,                  # treatment
              W = W,                  # baseline covariates
-             Q.SL.library = sl_lib, # libraries for initial estimate 
-             g.SL.library = sl_lib) # libraries for prob to be in treatment
+             Q.SL.library = sl_libs, # libraries for initial estimate 
+             g.SL.library = sl_libs) # libraries for prob to be in treatment
 
 # view results 
 tmle_fit
